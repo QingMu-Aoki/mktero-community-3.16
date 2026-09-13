@@ -22,7 +22,7 @@
 
 声明兼容 Zotero **7.0～10.0.***。开发检查和打包在 Windows 上完成；社区版尚未完成所有 Zotero 版本的实际验证。需要先将 PDF 附件下载到本机。
 
-1. 从 [本仓库的 Releases](https://github.com/QingMu-Aoki/mktero-community/releases/latest) 的 Assets 中下载 `mktero-community-<版本>.xpi`。
+1. 从 [本仓库的 Releases](https://github.com/QingMu-Aoki/mktero-community-3.16/releases/latest) 的 Assets 中下载 `mktero-community-<版本>.xpi`。
 2. **启用社区版前，先停用原版 Mktero 或此前的 Local Import Preview。** 社区版有独立插件 ID，但沿用已有设置及数据格式，不支持两者同时运行。
 3. 在 Zotero 中选择「工具 → 插件 → 齿轮 → 从文件安装插件」，选择 XPI。
 4. 打开「设置 → Mktero Community」，选择 MinerU，填写 API Token 后点击「保存账号配置」。已有 Token 设置可以继续使用。
