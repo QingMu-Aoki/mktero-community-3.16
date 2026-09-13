@@ -77,7 +77,7 @@ npm test
 构建安装包前必须指定自己的实际仓库：
 
 ```powershell
-$env:MKTERO_RELEASE_REPOSITORY = "QingMu-Aoki/mktero-community-3.16"
+$env:MKTERO_RELEASE_REPOSITORY = "QingMu-Aoki/mktero-community"
 npm run build
 ```
 
