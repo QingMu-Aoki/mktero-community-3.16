@@ -1,0 +1,18 @@
+{
+  "manifest_version": 2,
+  "name": "Mktero Community",
+  "version": "0.3.16",
+  "description": "Community fork: batch PDF-to-Markdown, local MinerU imports and automatic Zotero snapshots",
+  "author": "青木 · Aoki; original Mktero by Tony (tenglvjun)",
+  "icons": {
+    "48": "ui/icons/mktero.svg",
+    "96": "ui/icons/mktero.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "{c642b69a-e58f-4942-b03f-25db05b74e08}",
+      "strict_min_version": "7.0",
+      "strict_max_version": "10.0.*"
+    }
+  }
+}

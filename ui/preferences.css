@@ -1,0 +1,485 @@
+#mktero-preferences-pane {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 1040px;
+    padding: 8px 20px 36px;
+}
+
+.mktero-pref-tablist {
+    box-sizing: border-box;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 0 16px;
+    padding: 3px;
+    border: 1px solid var(--material-border, rgba(127, 127, 127, 0.28));
+    border-radius: 10px;
+    background: color-mix(in srgb, CanvasText 6%, Canvas);
+}
+
+.mktero-pref-tab,
+.mktero-pref-tab:link,
+.mktero-pref-tab:visited,
+.mktero-pref-tab:hover,
+.mktero-pref-tab:active {
+    -moz-appearance: none;
+    appearance: none;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: CanvasText;
+    font: inherit;
+    font-weight: 600;
+    line-height: 1.3;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.mktero-pref-tab:hover {
+    background: color-mix(in srgb, CanvasText 8%, transparent);
+}
+
+.mktero-pref-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.mktero-pref-tab-icon {
+    display: inline-flex;
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+}
+
+.mktero-pref-tab-icon svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+}
+
+.mktero-pref-tab[aria-selected='true'] {
+    background: Canvas;
+    color: CanvasText;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.mktero-pref-tab:focus-visible {
+    outline: 2px solid color-mix(in srgb, AccentColor 55%, transparent);
+    outline-offset: 1px;
+}
+
+.mktero-preferences-section {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+}
+
+.mktero-preferences-section[hidden] {
+    display: none;
+}
+
+.mktero-settings-card {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid var(--material-border, rgba(127, 127, 127, 0.28));
+    border-radius: 12px;
+    background: var(--material-background, Canvas);
+    color: CanvasText;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.mktero-setting-row {
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    width: 100%;
+    min-width: 0;
+    min-height: 64px;
+    padding: 16px 20px;
+}
+
+.mktero-field-row {
+    align-items: center;
+    gap: 28px;
+}
+
+.mktero-reader-font-row {
+    align-items: center;
+    gap: 28px;
+}
+
+.mktero-settings-card > .mktero-setting-row + .mktero-setting-row,
+#mktero-ai-settings,
+#mktero-ai-settings > .mktero-setting-row + .mktero-setting-row,
+.mktero-card-note {
+    border-top: 1px solid var(--material-border, rgba(127, 127, 127, 0.22));
+}
+
+.mktero-switch-row {
+    cursor: pointer;
+}
+
+.mktero-setting-copy {
+    box-sizing: border-box;
+    display: grid;
+    flex: 1 1 auto;
+    gap: 4px;
+    min-width: 0;
+}
+
+/* Keep the descriptive column readable when Zotero lays out XHTML inside XUL. */
+.mktero-field-row > .mktero-setting-copy,
+.mktero-reader-font-row > .mktero-setting-copy {
+    flex: 1 1 auto;
+    min-width: 240px;
+}
+
+.mktero-setting-copy strong {
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+.mktero-setting-copy small,
+.mktero-field-message,
+.mktero-field-meta,
+.mktero-card-note {
+    color: var(--fill-secondary, rgba(90, 90, 90, 0.88));
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+.mktero-field-control {
+    box-sizing: border-box;
+    display: grid;
+    flex: 0 0 280px;
+    gap: 6px;
+    min-width: 0;
+    width: 280px;
+    max-width: 48%;
+    margin-inline-start: auto;
+}
+
+.mktero-field-control-compact,
+.mktero-field-control-numeric {
+    flex-basis: 280px;
+    width: 280px;
+    max-width: 48%;
+}
+
+/* Zotero supplies the select dropmarker; forcing native appearance duplicates it on macOS. */
+.mktero-field-control input,
+.mktero-field-control select {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    min-height: 36px;
+    padding: 7px 11px;
+    border: 1px solid color-mix(in srgb, CanvasText 35%, Canvas);
+    border-radius: 8px;
+    background-color: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+    color: CanvasText;
+    color-scheme: light dark;
+    font: inherit;
+    line-height: 1.35;
+    opacity: 1;
+}
+
+.mktero-field-control select {
+    padding-inline-end: 32px;
+}
+
+.mktero-field-control.mktero-provider-control {
+    display: flex;
+    flex: 0 0 280px;
+    align-items: center;
+    gap: 8px;
+    width: 280px;
+    max-width: 48%;
+}
+
+.mktero-field-control.mktero-provider-control select {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+}
+
+.mktero-ai-test-icon {
+    box-sizing: border-box;
+    display: inline-flex;
+    flex: 0 0 36px;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    min-height: 36px;
+    margin: 0;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, CanvasText 35%, Canvas);
+    border-radius: 8px;
+    background-color: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+    color: CanvasText;
+    cursor: pointer;
+}
+
+.mktero-ai-test-icon svg {
+    display: block;
+    width: 16px;
+    height: 16px;
+}
+
+.mktero-ai-test-icon:hover {
+    border-color: color-mix(in srgb, CanvasText 55%, Canvas);
+}
+
+.mktero-ai-test-icon:focus-visible {
+    border-color: AccentColor;
+    outline: 2px solid color-mix(in srgb, AccentColor 28%, transparent);
+    outline-offset: 0;
+}
+
+.mktero-ai-test-icon:disabled {
+    cursor: progress;
+    opacity: 0.65;
+}
+
+/* Gecko paints number steppers on a separate native white surface on macOS. */
+.mktero-field-control input[type='number'] {
+    -moz-appearance: textfield;
+    text-align: end;
+}
+
+.mktero-field-control input[type='number']::-webkit-inner-spin-button,
+.mktero-field-control input[type='number']::-webkit-outer-spin-button {
+    margin: 0;
+    appearance: none;
+}
+
+.mktero-field-control input:hover,
+.mktero-field-control select:hover {
+    border-color: color-mix(in srgb, CanvasText 55%, Canvas);
+}
+
+.mktero-field-control input:focus,
+.mktero-field-control select:focus {
+    border-color: AccentColor;
+    outline: 2px solid color-mix(in srgb, AccentColor 28%, transparent);
+    outline-offset: 0;
+}
+
+.mktero-field-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.mktero-field-meta label[is="zotero-text-link"] {
+    flex: 0 0 auto;
+    margin: 0;
+    font-size: inherit;
+}
+
+.mktero-switch-control {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    width: 36px;
+    height: 20px;
+    position: relative;
+}
+
+.mktero-reader-font-control {
+    display: flex;
+    box-sizing: border-box;
+    flex: 0 0 280px;
+    width: 280px;
+    max-width: 48%;
+    min-width: 0;
+    margin-inline-start: auto;
+    align-items: center;
+    gap: 12px;
+}
+
+.mktero-reader-font-control input,
+.mktero-reader-font-control select {
+    flex: 1 1 auto;
+    min-width: 0;
+    accent-color: AccentColor;
+}
+
+.mktero-reader-font-control select {
+    min-height: 36px;
+    padding: 7px 11px;
+    border: 1px solid color-mix(in srgb, CanvasText 35%, Canvas);
+    border-radius: 7px;
+    background-color: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+    color: CanvasText;
+    color-scheme: light dark;
+    font: inherit;
+}
+
+.mktero-reader-font-control output {
+    min-width: 42px;
+    color: var(--fill-secondary, rgba(90, 90, 90, 0.88));
+    font-size: 0.9rem;
+    font-variant-numeric: tabular-nums;
+    text-align: end;
+}
+
+.mktero-switch-input {
+    position: absolute;
+    z-index: 1;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+.mktero-switch {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 999px;
+    background: rgba(127, 127, 127, 0.28);
+    position: relative;
+    pointer-events: none;
+    transition: background-color 120ms ease;
+}
+
+.mktero-switch::before {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+    transition: transform 120ms ease;
+}
+
+.mktero-switch-input:checked + .mktero-switch {
+    background: AccentColor;
+}
+
+.mktero-switch-input:checked + .mktero-switch::before {
+    transform: translateX(16px);
+}
+
+.mktero-switch-input:focus-visible + .mktero-switch {
+    outline: 2px solid AccentColor;
+    outline-offset: 2px;
+}
+
+#mktero-clear-cache {
+    -moz-appearance: none;
+    appearance: none;
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    min-height: 36px;
+    margin: 0;
+    padding: 7px 11px;
+    border: 1px solid color-mix(in srgb, CanvasText 35%, Canvas);
+    border-radius: 8px;
+    background-color: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+    color: CanvasText;
+    color-scheme: light dark;
+    font: inherit;
+    line-height: 1.35;
+    cursor: pointer;
+}
+
+#mktero-clear-cache:hover {
+    border-color: color-mix(in srgb, CanvasText 55%, Canvas);
+}
+
+#mktero-clear-cache:focus-visible {
+    border-color: AccentColor;
+    outline: 2px solid color-mix(in srgb, AccentColor 28%, transparent);
+    outline-offset: 0;
+}
+
+#mktero-clear-cache:disabled {
+    cursor: progress;
+    opacity: 0.65;
+}
+
+#mktero-ai-settings[hidden],
+#mktero-ai-api-base-row[hidden],
+#mktero-ai-protocol-row[hidden] {
+    display: none;
+}
+
+.mktero-card-note {
+    display: block;
+    box-sizing: border-box;
+    padding: 12px 20px;
+    background: color-mix(in srgb, currentColor 3%, transparent);
+}
+
+@media (max-width: 700px) {
+    #mktero-preferences-pane {
+        padding-inline: 16px;
+    }
+
+    .mktero-field-row,
+    .mktero-reader-font-row {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .mktero-field-control,
+    .mktero-reader-font-control {
+        width: 100%;
+        flex: 0 0 auto;
+        max-width: none;
+    }
+
+    .mktero-field-row > .mktero-setting-copy,
+    .mktero-reader-font-row > .mktero-setting-copy {
+        min-width: 0;
+    }
+
+    .mktero-field-control-compact,
+    .mktero-field-control-numeric {
+        width: 100%;
+        max-width: 100%;
+        flex-basis: auto;
+        flex: 1 1 auto;
+    }
+}
+
+@media (max-width: 480px) {
+    .mktero-setting-row {
+        gap: 16px;
+        padding: 14px 12px;
+    }
+
+    .mktero-cache-usage-row {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    #mktero-clear-cache {
+        align-self: flex-start;
+    }
+
+    .mktero-card-note {
+        padding: 10px 12px;
+    }
+}

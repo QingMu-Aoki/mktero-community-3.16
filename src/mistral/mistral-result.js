@@ -1,0 +1,1300 @@
+import { createMarkdownSourceMap } from '../core/markdown-source-map.js';
+import {
+    absorbBlankLines,
+    mapChromeRanges,
+    normalizeChromeRanges,
+} from '../markdown/chrome-ranges.js';
+import {
+    normalizeMistralFigureLayouts,
+    normalizeMistralMarkdown,
+} from './markdown-normalizer.js';
+
+export const DEFAULT_MAX_MISTRAL_PAGES = 1_000;
+export const DEFAULT_MAX_MISTRAL_MARKDOWN_BYTES = 50 * 1024 * 1024;
+export const DEFAULT_MAX_MISTRAL_BLOCKS = 100_000;
+export const DEFAULT_MAX_MISTRAL_ASSETS = 2_000;
+export const DEFAULT_MAX_MISTRAL_ASSET_BYTES = 25 * 1024 * 1024;
+export const DEFAULT_MAX_MISTRAL_TOTAL_ASSET_BYTES = 150 * 1024 * 1024;
+export const DEFAULT_MAX_MISTRAL_SOURCE_LOCATIONS = 100_000;
+export const DEFAULT_MAX_MISTRAL_BBOX_CHECKS = 2_000_000;
+
+const IMAGE_MIME_TYPES = new Map([
+    ['png', 'image/png'],
+    ['jpg', 'image/jpeg'],
+    ['jpeg', 'image/jpeg'],
+    ['gif', 'image/gif'],
+    ['webp', 'image/webp'],
+]);
+
+const BLOCK_TYPES = new Map([
+    ['text', 'text'],
+    ['paragraph', 'text'],
+    ['heading', 'heading'],
+    ['title', 'heading'],
+    ['list', 'list'],
+    ['table', 'table'],
+    ['image', 'image'],
+    ['picture', 'image'],
+    ['figure', 'image'],
+    ['chart', 'chart'],
+    ['equation', 'equation'],
+    ['formula', 'equation'],
+    ['caption', 'caption'],
+    ['code', 'code'],
+    ['reference', 'reference'],
+    ['bibliography', 'reference'],
+    ['references', 'reference'],
+    ['aside_text', 'text'],
+    ['signature', 'text'],
+    ['header', 'header'],
+    ['footer', 'footer'],
+]);
+
+const MISTRAL_COLUMN_TOP_THRESHOLD = 240;
+const MISTRAL_COLUMN_BOTTOM_THRESHOLD = 760;
+const MISTRAL_MIN_COLUMN_GAP = 20;
+// Mistral can append conversion-engine labels after the publisher footer
+// (for example, "XSL·FO" and "RenderX"). Keep enough trailing lines in the
+// candidate window to cover the complete footer cluster without scanning body
+// text indiscriminately.
+const MISTRAL_PAGE_EDGE_WINDOW = 12;
+const UNAMBIGUOUS_PUBLISHER_FOOTER_KINDS = new Set([
+    'article-url',
+    'volume',
+    'citation-note',
+    'xsl-fo',
+    'renderx',
+    'publisher-masthead',
+]);
+const MISTRAL_SENTENCE_END_PATTERN = /[.!?。！？]["'”’»)]*$/u;
+const MISTRAL_NON_PROSE_START_PATTERN = /^(?:#{1,6}(?:\s|$)|(?:[-+*]|\d+[.)])\s+|>\s|```|~~~|<|\|)/u;
+
+/**
+ * Convert a Mistral OCR response into the document shape consumed by Mktero.
+ * Mistral pages are deliberately kept in API reading order; MinerU's layout
+ * reassembly must never be applied to this result.
+ */
+export function normalizeMistralResult(response, options = {}) {
+    const limits = normalizeLimits(options);
+    const pages = validatePages(response, limits.maxPages);
+    const pageRecords = pages
+        .slice()
+        .sort((left, right) => left.index - right.index);
+
+    const warnings = [];
+    const usedPaths = new Set();
+    const pageAssets = new Map();
+    const pageTables = new Map();
+    const pageBlockRecords = new Map();
+    const tableBudget = { count: 0, bytes: 0 };
+    const blockBudget = { count: 0 };
+    const bboxMatchBudget = { remaining: limits.maxBBoxChecks };
+    const assets = [];
+    let totalAssetBytes = 0;
+
+    for (const page of pageRecords) {
+        const pageMap = new Map();
+        pageAssets.set(page.index, pageMap);
+        const imageList = page.images;
+        if (imageList !== undefined && !Array.isArray(imageList)) {
+            throw invalidResult('Mistral page images must be an array');
+        }
+        for (const image of imageList || []) {
+            if (!image || typeof image !== 'object' || Array.isArray(image)) {
+                throw invalidResult('Mistral image metadata is invalid');
+            }
+            const id = normalizeAssetPath(image.id);
+            if (pageMap.has(id)) {
+                throw invalidResult('Mistral page contains duplicate image IDs');
+            }
+            let path = id;
+            if (usedPaths.has(path)) {
+                path = `pages/${page.index}/${id}`;
+                if (usedPaths.has(path)) {
+                    throw invalidResult('Mistral image paths are ambiguous');
+                }
+            }
+            if (assets.length >= limits.maxAssets
+                || totalAssetBytes >= limits.maxTotalAssetBytes) {
+                throw invalidResult('Mistral images exceed the configured resource limit');
+            }
+            const decoded = decodeImage(
+                image.image_base64 ?? image.imageBase64 ?? image.data,
+                image.mime_type ?? image.mimeType ?? image.content_type,
+                path,
+                Math.min(
+                    limits.maxAssetBytes,
+                    limits.maxTotalAssetBytes - totalAssetBytes
+                )
+            );
+            totalAssetBytes += decoded.data.length;
+            if (totalAssetBytes > limits.maxTotalAssetBytes) {
+                throw invalidResult('Mistral images exceed the configured resource limit');
+            }
+            usedPaths.add(path);
+            pageMap.set(id, path);
+            pageMap.set(decoded.source, path);
+            assets.push({
+                path,
+                mimeType: decoded.mimeType,
+                data: decoded.data,
+            });
+        }
+    }
+
+    const pageSources = pageRecords.map(page => {
+        if (typeof page.markdown !== 'string') {
+            throw invalidResult('Mistral page Markdown is invalid');
+        }
+        if (Array.isArray(page.blocks)) {
+            blockBudget.count += page.blocks.length;
+            if (blockBudget.count > limits.maxBlocks) {
+                throw invalidResult('Mistral blocks exceed the configured resource limit');
+            }
+        }
+        const tables = normalizePageTables(page, warnings, limits, tableBudget);
+        pageTables.set(page.index, tables);
+        const dimensions = normalizeDimensions(page.dimensions);
+        const records = normalizePageBlockRecords(
+            page,
+            dimensions,
+            pageAssets.get(page.index),
+            tables,
+            warnings
+        );
+        appendImageMetadataRecords(
+            records,
+            page,
+            dimensions,
+            pageAssets.get(page.index)
+        );
+        const interiorTextRecords = findImageInteriorTextRecords(
+            records,
+            bboxMatchBudget
+        );
+        const blockRecord = {
+            records,
+            interiorTextRecords,
+            chromeRecords: new Set(),
+        };
+        pageBlockRecords.set(page.index, blockRecord);
+        let source = removeImageInteriorText(
+            page.markdown.replace(/\r\n?/g, '\n').trim(),
+            interiorTextRecords
+        );
+        source = normalizeMistralMarkdown(
+            source,
+            {
+                tables,
+                onMissingTable: reference => warnings.push(
+                    `Mistral table reference "${reference}" on page ${page.index} has no table content.`
+                ),
+            }
+        );
+        source = rewriteMarkdownImages(source, pageAssets.get(page.index));
+        return { page, source, records };
+    });
+    const repeatedChromeLines = findRepeatedPageChromeLines(pageSources);
+    const markdownPages = pageSources.map(({ page, source, records }) => {
+        const detected = detectMistralPageChrome(
+            source,
+            page.index,
+            records,
+            repeatedChromeLines
+        );
+        pageBlockRecords.get(page.index).chromeRecords = detected.chromeRecords;
+        const laidOut = normalizeMistralFigureLayouts(
+            detected.markdown,
+            records
+                .map(record => record.normalized)
+                .filter(block => block?.type === 'image' || block?.type === 'chart')
+        );
+        return {
+            markdown: laidOut,
+            records,
+            chromeRanges: mapChromeRangesThroughRewrite(
+                detected.chromeRanges,
+                detected.markdown,
+                laidOut
+            ),
+        };
+    });
+    const joined = joinMarkdownPages(markdownPages);
+    const flowed = applyMistralTextFlow(
+        joined.markdown,
+        markdownPages.flatMap(page => page.records)
+    );
+    const markdown = flowed.markdown;
+    const chromeRanges = normalizeChromeRanges(
+        absorbBlankLines(
+            markdown,
+            mapChromeRanges(
+                joined.chromeRanges,
+                flowed.transforms,
+                markdown.length
+            )
+        ),
+        markdown.length
+    );
+    if (!markdown.trim()) throw invalidResult('Mistral result contains no Markdown');
+    if (new TextEncoder().encode(markdown).length > limits.maxMarkdownBytes) {
+        throw invalidResult('Mistral Markdown exceeds the configured resource limit');
+    }
+
+    const contentList = [];
+    for (const page of pageRecords) {
+        const blockRecords = pageBlockRecords.get(page.index);
+        for (const record of blockRecords?.records || []) {
+            if (contentList.length >= limits.maxBlocks) {
+                throw invalidResult('Mistral blocks exceed the configured resource limit');
+            }
+            if (!record.normalized
+                || blockRecords.interiorTextRecords.has(record)
+                || blockRecords.chromeRecords?.has(record)
+                || ['header', 'footer'].includes(record.normalized.type)) {
+                continue;
+            }
+            contentList.push(record.normalized);
+        }
+    }
+
+    let sourceMap = createMarkdownSourceMap(
+        markdown,
+        contentList,
+        {
+            includeMatchedTextRanges: true,
+            maxContentBlocks: limits.maxBlocks,
+        }
+    );
+    sourceMap = limitSourceMap(sourceMap, limits.maxSourceLocations);
+    const totalPages = Number.isSafeInteger(response?.usage_info?.pages_processed)
+        && response.usage_info.pages_processed >= 0
+        ? response.usage_info.pages_processed
+        : pageRecords.length;
+    return {
+        markdown,
+        assets,
+        assetBasePath: '',
+        contentList,
+        sourceMap,
+        chromeRanges,
+        extractedPages: pageRecords.length,
+        totalPages,
+        warnings,
+    };
+}
+
+function validatePages(response, maxPages) {
+    if (!response || typeof response !== 'object' || Array.isArray(response)
+        || !Array.isArray(response.pages)
+        || !response.pages.length
+        || response.pages.length > maxPages) {
+        throw invalidResult('Mistral OCR pages are invalid');
+    }
+    const seen = new Set();
+    for (const page of response.pages) {
+        if (!page || typeof page !== 'object' || Array.isArray(page)
+            || !Number.isSafeInteger(page.index)
+            || page.index < 0
+            || seen.has(page.index)) {
+            throw invalidResult('Mistral page indexes are invalid');
+        }
+        seen.add(page.index);
+    }
+    return response.pages;
+}
+
+function normalizeLimits(options) {
+    return {
+        maxPages: boundedLimit(
+            options.maxPages,
+            DEFAULT_MAX_MISTRAL_PAGES
+        ),
+        maxMarkdownBytes: boundedLimit(
+            options.maxMarkdownBytes,
+            DEFAULT_MAX_MISTRAL_MARKDOWN_BYTES
+        ),
+        maxBlocks: boundedLimit(options.maxBlocks, DEFAULT_MAX_MISTRAL_BLOCKS),
+        maxAssets: boundedLimit(options.maxAssets, DEFAULT_MAX_MISTRAL_ASSETS),
+        maxAssetBytes: boundedLimit(
+            options.maxAssetBytes,
+            DEFAULT_MAX_MISTRAL_ASSET_BYTES
+        ),
+        maxTotalAssetBytes: boundedLimit(
+            options.maxTotalAssetBytes,
+            DEFAULT_MAX_MISTRAL_TOTAL_ASSET_BYTES
+        ),
+        maxSourceLocations: boundedLimit(
+            options.maxSourceLocations,
+            DEFAULT_MAX_MISTRAL_SOURCE_LOCATIONS
+        ),
+        maxBBoxChecks: boundedLimit(
+            options.maxBBoxChecks,
+            DEFAULT_MAX_MISTRAL_BBOX_CHECKS
+        ),
+    };
+}
+
+function boundedLimit(value, fallback) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function normalizeDimensions(dimensions) {
+    if (!dimensions || typeof dimensions !== 'object') return null;
+    const width = dimensions.width;
+    const height = dimensions.height;
+    return Number.isFinite(width) && width > 0
+        && Number.isFinite(height) && height > 0
+        ? { width, height }
+        : null;
+}
+
+function normalizePageTables(page, warnings, limits, budget) {
+    const tables = new Map();
+    const rawTables = page.tables;
+    if (rawTables === undefined) return tables;
+    if (!Array.isArray(rawTables)) {
+        warnings.push(`Mistral tables on page ${page.index} were skipped.`);
+        return tables;
+    }
+    for (const table of rawTables) {
+        budget.count++;
+        if (budget.count > limits.maxBlocks) {
+            throw invalidResult('Mistral tables exceed the configured resource limit');
+        }
+        if (!table || typeof table !== 'object' || Array.isArray(table)) {
+            warnings.push(`Mistral table on page ${page.index} was skipped.`);
+            continue;
+        }
+        const id = normalizeTableID(table.id);
+        if (!id) {
+            warnings.push(`Mistral table on page ${page.index} has an invalid ID.`);
+            continue;
+        }
+        const format = table.format ?? table.format_;
+        if (format !== undefined
+            && (typeof format !== 'string'
+                || format.trim().toLowerCase() !== 'markdown')) {
+            warnings.push(
+                `Mistral table "${table.id}" on page ${page.index}`
+                + ' has an unsupported format.'
+            );
+            continue;
+        }
+        if (typeof table.content !== 'string' || !table.content.trim()) {
+            warnings.push(`Mistral table "${table.id}" on page ${page.index} has no content.`);
+            continue;
+        }
+        if (tables.has(id)) {
+            warnings.push(
+                `Mistral page ${page.index} contains duplicate table ID`
+                + ` "${table.id}".`
+            );
+            continue;
+        }
+        const content = table.content.replace(/\r\n?/g, '\n').trim();
+        budget.bytes += new TextEncoder().encode(content).length;
+        if (budget.bytes > limits.maxMarkdownBytes) {
+            throw invalidResult(
+                'Mistral table content exceeds the configured resource limit'
+            );
+        }
+        tables.set(id, content);
+    }
+    return tables;
+}
+
+function normalizeTableID(value) {
+    if (typeof value !== 'string') return null;
+    const source = value.trim();
+    if (!source || !/^tbl-[^/\\?#]+(?:\.md)?$/iu.test(source)) return null;
+    const id = source.replace(/\.md$/iu, '');
+    if (!/^tbl-[^/\\?#]+$/iu.test(id) || /\.md$/iu.test(id)) return null;
+    return id.toLowerCase();
+}
+
+function normalizePageBlockRecords(
+    page,
+    dimensions,
+    pageMap,
+    tables,
+    warnings
+) {
+    const blocks = page.blocks;
+    if (blocks !== undefined && !Array.isArray(blocks)) {
+        warnings.push(`Mistral blocks on page ${page.index} were skipped.`);
+        return [];
+    }
+    const rawBlocks = [...(blocks || [])];
+    // Some API responses expose tables separately from blocks. Include them
+    // only as a fallback so that a table can still be source-mapped.
+    if (!rawBlocks.length && Array.isArray(page.tables)) {
+        rawBlocks.push(...page.tables.map(table => ({
+            ...table,
+            type: table?.type || 'table',
+        })));
+    }
+    return rawBlocks.map(block => ({
+        normalized: normalizeBlock(
+            block,
+            page,
+            dimensions,
+            pageMap,
+            tables,
+            warnings
+        ),
+    }));
+}
+
+function appendImageMetadataRecords(records, page, dimensions, pageMap) {
+    if (!dimensions || !Array.isArray(page.images)) return;
+    const mappedAssets = new Set(records
+        .map(record => record.normalized)
+        .filter(block => block?.type === 'image' || block?.type === 'chart')
+        .map(block => block.assetPath));
+    for (const image of page.images) {
+        const assetPath = resolveAssetPath(image?.id, pageMap);
+        const bbox = normalizeBBox(
+            image?.bbox
+                ?? image?.bounding_box
+                ?? image?.boundingBox
+                ?? image,
+            dimensions
+        );
+        if (!assetPath || !bbox || mappedAssets.has(assetPath)) continue;
+        records.push({
+            normalized: {
+                type: 'image',
+                pageIndex: page.index,
+                bbox,
+                assetPath,
+            },
+        });
+        mappedAssets.add(assetPath);
+    }
+}
+
+function findImageInteriorTextRecords(records, matchBudget) {
+    const imageBlocks = records
+        .map(record => record.normalized)
+        .filter(block => block?.type === 'image' || block?.type === 'chart');
+    if (!imageBlocks.length) return new Set();
+
+    return new Set(records.filter(record => {
+        const block = record.normalized;
+        if (!block || !block.text || block.type === 'image' || block.type === 'chart') {
+            return false;
+        }
+        return imageBlocks.some(image => {
+            if (image.pageIndex !== block.pageIndex) return false;
+            if (matchBudget.remaining <= 0) {
+                throw invalidResult(
+                    'Mistral layout matching exceeds the configured resource limit'
+                );
+            }
+            matchBudget.remaining--;
+            return isMostlyContainedBBox(block.bbox, image.bbox);
+        });
+    }));
+}
+
+function isMostlyContainedBBox(inner, outer) {
+    const innerArea = bboxArea(inner);
+    if (!innerArea) return false;
+    const intersection = bboxIntersection(inner, outer);
+    if (!intersection) return false;
+    return bboxArea(intersection) / innerArea >= 0.8;
+}
+
+function bboxArea(bbox) {
+    return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]);
+}
+
+function bboxIntersection(left, right) {
+    const intersection = [
+        Math.max(left[0], right[0]),
+        Math.max(left[1], right[1]),
+        Math.min(left[2], right[2]),
+        Math.min(left[3], right[3]),
+    ];
+    return intersection[2] > intersection[0]
+        && intersection[3] > intersection[1]
+        ? intersection
+        : null;
+}
+
+function removeImageInteriorText(markdown, records) {
+    if (!markdown || !records?.size) return markdown;
+    const lines = markdown.match(/[^\r\n]*(?:\r\n|\n|$)/g) || [];
+    const lineIndexesByText = new Map();
+    for (const [index, line] of lines.entries()) {
+        const text = comparableMarkdownText(line);
+        if (!text) continue;
+        const indexes = lineIndexesByText.get(text) || [];
+        indexes.push(index);
+        lineIndexesByText.set(text, indexes);
+    }
+    const candidates = new Set([...records]
+        .flatMap(record => splitBlockTextLines(record.normalized?.text))
+        .map(comparableMarkdownText)
+        .filter(Boolean));
+
+    const matches = new Map();
+    for (const candidate of candidates) {
+        const matchingIndexes = lineIndexesByText.get(candidate) || [];
+        // A duplicated label is ambiguous without a text block range. Keep it
+        // visible rather than risk removing ordinary prose elsewhere.
+        if (matchingIndexes.length === 1) {
+            matches.set(matchingIndexes[0], true);
+        }
+    }
+    if (!matches.size) return markdown;
+    return lines.filter((line, index) => !matches.has(index)).join('').trim();
+}
+
+function findRepeatedPageChromeLines(pageSources) {
+    const pagesByText = new Map();
+    for (const { page, source } of pageSources) {
+        const lines = source.match(/[^\r\n]*(?:\r\n|\n|$)/g) || [];
+        const edgeIndexes = edgeLineIndexes(lines);
+        const seenOnPage = new Set();
+        for (const index of edgeIndexes) {
+            const text = comparableMarkdownText(lines[index]);
+            if (!text || !isLikelyPageChromeText(text)) continue;
+            for (const key of pageChromeKeys(text)) seenOnPage.add(key);
+        }
+        for (const text of seenOnPage) {
+            const pages = pagesByText.get(text) || new Set();
+            pages.add(page.index);
+            pagesByText.set(text, pages);
+        }
+    }
+    return new Set([...pagesByText]
+        .filter(([, pages]) => pages.size >= 2)
+        .map(([text]) => text));
+}
+
+function detectMistralPageChrome(markdown, pageIndex, records, repeatedLines) {
+    const context = createPageChromeContext(markdown, records, repeatedLines);
+    const removableIndexes = findRemovablePageChromeIndexes(
+        context,
+        repeatedLines
+    );
+
+    if (pageIndex === 0) {
+        for (const index of findPublisherMastheadIndexes(context.lines)) {
+            removableIndexes.add(index);
+        }
+    }
+
+    const chromeRecords = findChromeRecords(
+        records,
+        context.edgeTextByIndex,
+        removableIndexes
+    );
+
+    return {
+        markdown,
+        chromeRecords,
+        chromeRanges: chromeRangesForLineIndexes(context.lines, removableIndexes),
+    };
+}
+
+function chromeRangesForLineIndexes(lines, indexes) {
+    const ranges = [];
+    let offset = 0;
+    for (const [index, line] of lines.entries()) {
+        const from = offset;
+        const to = offset + line.length;
+        offset = to;
+        if (indexes.has(index) && from < to) {
+            ranges.push({ from, to });
+        }
+    }
+    return ranges;
+}
+
+function joinMarkdownPages(pages) {
+    const nonEmpty = pages.filter(page => page.markdown.length > 0);
+    const chromeRanges = [];
+    let offset = 0;
+    const parts = [];
+    for (const [index, page] of nonEmpty.entries()) {
+        for (const range of page.chromeRanges || []) {
+            chromeRanges.push({
+                from: range.from + offset,
+                to: range.to + offset,
+            });
+        }
+        parts.push(page.markdown);
+        offset += page.markdown.length;
+        if (index < nonEmpty.length - 1) offset += 2;
+    }
+    return {
+        markdown: parts.join('\n\n'),
+        chromeRanges,
+    };
+}
+
+function mapChromeRangesThroughRewrite(ranges, before, after) {
+    if (before === after) {
+        return normalizeChromeRanges(ranges, after.length);
+    }
+    const transform = inferReplacementTransform(before, after);
+    if (!transform) {
+        return normalizeChromeRanges(ranges, after.length);
+    }
+    return mapChromeRanges(ranges, [transform], after.length);
+}
+
+function inferReplacementTransform(before, after) {
+    let prefix = 0;
+    const maxPrefix = Math.min(before.length, after.length);
+    while (prefix < maxPrefix && before[prefix] === after[prefix]) prefix++;
+    let suffix = 0;
+    const maxSuffix = Math.min(before.length - prefix, after.length - prefix);
+    while (
+        suffix < maxSuffix
+        && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+    ) {
+        suffix++;
+    }
+    const from = prefix;
+    const to = before.length - suffix;
+    const replacementLength = after.length - prefix - suffix;
+    if (from === to && replacementLength === 0) return null;
+    return { from, to, replacementLength };
+}
+
+function createPageChromeContext(markdown, records, repeatedLines) {
+    const lines = markdown.match(/[^\r\n]*(?:\r\n|\n|$)/g) || [];
+    const edgeIndexes = edgeLineIndexes(lines);
+    const footerEdgeIndexes = bottomEdgeLineIndexes(lines);
+    const candidateIndexes = new Set([...edgeIndexes, ...footerEdgeIndexes]);
+    const edgeTextByIndex = new Map([...candidateIndexes].map(index => (
+        [index, comparableMarkdownText(lines[index])]
+    )));
+    const referenceIndexes = findReferenceIndexes(
+        lines,
+        candidateIndexes,
+        footerEdgeIndexes,
+        edgeTextByIndex,
+        records,
+        repeatedLines,
+    );
+    return {
+        lines,
+        edgeIndexes,
+        footerEdgeIndexes,
+        candidateIndexes,
+        edgeTextByIndex,
+        referenceIndexes,
+    };
+}
+
+function findReferenceIndexes(
+    lines,
+    candidateIndexes,
+    footerEdgeIndexes,
+    edgeTextByIndex,
+    records,
+    repeatedLines
+) {
+    const referenceTexts = new Set();
+    for (const record of records) {
+        if (record.normalized?.type !== 'reference') continue;
+        for (const line of splitBlockTextLines(record.normalized.text)) {
+            referenceTexts.add(comparableMarkdownText(line));
+        }
+    }
+    const referenceIndexes = new Set([...edgeTextByIndex]
+        .filter(([, text]) => text && referenceTexts.has(text))
+        .map(([index]) => index));
+    const referenceHeadingIndex = lines.findIndex(line => (
+        /^ {0,3}#{1,6}[ \t]+(?:references|bibliography)\b/iu.test(line)
+    ));
+    if (referenceHeadingIndex < 0) return referenceIndexes;
+    const hasRepeatedPublisherFooter = [...footerEdgeIndexes].some(index => {
+        const text = edgeTextByIndex.get(index);
+        return isUnambiguousPublisherFooterText(text)
+            && pageChromeKeys(text).some(key => repeatedLines.has(key));
+    });
+    const hasAdjacentVolumeFooter = [...footerEdgeIndexes].some(index => {
+        if (publisherFooterKind(edgeTextByIndex.get(index)) !== 'article-url') {
+            return false;
+        }
+        return [...footerEdgeIndexes].some(otherIndex => (
+            Math.abs(otherIndex - index) <= 4
+            && publisherFooterKind(edgeTextByIndex.get(otherIndex)) === 'volume'
+        ));
+    });
+    for (const index of candidateIndexes) {
+        const text = edgeTextByIndex.get(index);
+        const isPublisherFooter = isUnambiguousPublisherFooterText(text)
+            && (hasRepeatedPublisherFooter || hasAdjacentVolumeFooter);
+        if (index > referenceHeadingIndex
+            && !isPublisherFooter) {
+            referenceIndexes.add(index);
+        }
+    }
+    return referenceIndexes;
+}
+
+function findRemovablePageChromeIndexes(context, repeatedLines) {
+    const {
+        edgeIndexes,
+        footerEdgeIndexes,
+        candidateIndexes,
+        edgeTextByIndex,
+        referenceIndexes,
+    } = context;
+    const hasRepeatedPublisherFooter = [...footerEdgeIndexes].some(index => {
+        if (referenceIndexes.has(index)) return false;
+        const text = edgeTextByIndex.get(index);
+        return text
+            && isPublisherFooterText(text)
+            && pageChromeKeys(text).some(key => repeatedLines.has(key));
+    });
+    const publisherFooterKinds = new Set([...footerEdgeIndexes]
+        .filter(index => !referenceIndexes.has(index))
+        .map(index => publisherFooterKind(edgeTextByIndex.get(index)))
+        .filter(Boolean));
+    const hasGroupedPublisherFooter = publisherFooterKinds.size >= 2;
+    const removableIndexes = new Set();
+    for (const index of candidateIndexes) {
+        if (referenceIndexes.has(index)) continue;
+        const text = edgeTextByIndex.get(index);
+        if (!text) continue;
+        const repeatedChrome = (
+            edgeIndexes.has(index)
+            || (footerEdgeIndexes.has(index) && isPublisherFooterText(text))
+        ) && pageChromeKeys(text).some(key => repeatedLines.has(key));
+        if (isPageNumberText(text)
+            || repeatedChrome
+            || (footerEdgeIndexes.has(index)
+                && (hasRepeatedPublisherFooter || hasGroupedPublisherFooter)
+                && isPublisherFooterText(text))) {
+            removableIndexes.add(index);
+        }
+    }
+    return removableIndexes;
+}
+
+function findChromeRecords(records, edgeTextByIndex, removableIndexes) {
+    const chromeRecords = new Set();
+    for (const record of records) {
+        const block = record.normalized;
+        if (!block || !block.text) continue;
+        const blockTexts = new Set(splitBlockTextLines(block.text)
+            .map(comparableMarkdownText)
+            .filter(Boolean));
+        const matchingIndexes = [...edgeTextByIndex]
+            .filter(([, text]) => text && blockTexts.has(text))
+            .map(([index]) => index);
+        if (!matchingIndexes.length) continue;
+        const explicitChrome = ['header', 'footer'].includes(block.type)
+            && isPageEdgeBBox(block.bbox);
+        const chromeMatches = matchingIndexes.filter(index => (
+            explicitChrome || removableIndexes.has(index)
+        ));
+        const implicitChrome = isPageEdgeBBox(block.bbox)
+            && chromeMatches.length > 0;
+        if (!explicitChrome && !implicitChrome) continue;
+        for (const index of chromeMatches) removableIndexes.add(index);
+        chromeRecords.add(record);
+    }
+    return chromeRecords;
+}
+
+function applyMistralTextFlow(markdown, records) {
+    const textBlocks = records
+        .map(record => record.normalized)
+        .filter(block => block?.type === 'text');
+    if (!markdown || textBlocks.length < 2) {
+        return { markdown, transforms: [] };
+    }
+
+    const sourceMap = createMarkdownSourceMap(markdown, textBlocks, {
+        includeMatchedTextRanges: true,
+    });
+    const entries = sourceMap
+        .filter(entry => entry.type === 'text' && entry.locations.length === 1)
+        .sort((left, right) => left.markdownFrom - right.markdownFrom);
+    const edits = [];
+
+    for (let index = 1; index < entries.length; index++) {
+        const previous = entries[index - 1];
+        const current = entries[index];
+        if (!isMistralColumnContinuation(markdown, previous, current)) continue;
+        edits.push({
+            from: previous.markdownTo,
+            to: current.markdownFrom,
+            replacement: ' ',
+        });
+    }
+    const applied = applyMistralTextFlowEdits(markdown, edits);
+    return {
+        markdown: applied.markdown,
+        transforms: [...applied.edits]
+            .sort((left, right) => left.from - right.from)
+            .map(edit => ({
+                from: edit.from,
+                to: edit.to,
+                replacementLength: edit.replacement.length,
+            })),
+    };
+}
+
+function isMistralColumnContinuation(markdown, previous, current) {
+    const previousLocation = previous.locations[0];
+    const currentLocation = current.locations[0];
+    const samePage = previousLocation.pageIndex === currentLocation.pageIndex;
+    const nextPage = currentLocation.pageIndex === previousLocation.pageIndex + 1;
+    if (!samePage && !nextPage) return false;
+
+    const previousBox = previousLocation.bbox;
+    const currentBox = currentLocation.bbox;
+    if (!Array.isArray(previousBox) || previousBox.length !== 4
+        || !Array.isArray(currentBox) || currentBox.length !== 4) {
+        return false;
+    }
+    if (previousBox[3] < MISTRAL_COLUMN_BOTTOM_THRESHOLD
+        || currentBox[1] > MISTRAL_COLUMN_TOP_THRESHOLD) {
+        return false;
+    }
+    if (samePage && !areSequentialMistralColumns(previousBox, currentBox)) {
+        return false;
+    }
+
+    const between = markdown.slice(previous.markdownTo, current.markdownFrom);
+    if (!/^\s+$/u.test(between)) return false;
+
+    const previousText = markdown.slice(previous.markdownFrom, previous.markdownTo)
+        .trimEnd();
+    const currentText = markdown.slice(current.markdownFrom, current.markdownTo)
+        .trimStart();
+    if (!previousText || !currentText
+        || MISTRAL_NON_PROSE_START_PATTERN.test(currentText)) {
+        return false;
+    }
+    return !MISTRAL_SENTENCE_END_PATTERN.test(previousText)
+        || /^[\p{Ll}\p{Mn}\s\])},.;:]/u.test(currentText);
+}
+
+function areSequentialMistralColumns(previousBox, currentBox) {
+    return previousBox[2] <= currentBox[0]
+        && currentBox[0] - previousBox[2] >= MISTRAL_MIN_COLUMN_GAP;
+}
+
+function applyMistralTextFlowEdits(markdown, edits) {
+    const sorted = [...edits].sort((left, right) => right.from - left.from);
+    let result = markdown;
+    let lastFrom = markdown.length + 1;
+    const applied = [];
+    for (const edit of sorted) {
+        if (edit.to > lastFrom) continue;
+        result = result.slice(0, edit.from)
+            + edit.replacement
+            + result.slice(edit.to);
+        lastFrom = edit.from;
+        applied.push(edit);
+    }
+    return { markdown: result, edits: applied };
+}
+
+function edgeLineIndexes(lines) {
+    const nonEmpty = nonEmptyLineIndexes(lines);
+    return new Set([
+        ...nonEmpty.slice(0, 3),
+        ...nonEmpty.slice(-3),
+    ]);
+}
+
+function bottomEdgeLineIndexes(lines) {
+    return new Set(nonEmptyLineIndexes(lines).slice(-MISTRAL_PAGE_EDGE_WINDOW));
+}
+
+function nonEmptyLineIndexes(lines) {
+    return lines
+        .map((line, index) => line.trim() ? index : null)
+        .filter(index => index !== null);
+}
+
+function isPageEdgeBBox(bbox) {
+    return Array.isArray(bbox)
+        && bbox.length === 4
+        && (bbox[1] <= 180 || bbox[3] >= 820);
+}
+
+function isPageNumberText(text) {
+    return /^(?:page\s+)?\d+\s+of\s+\d+$/iu.test(text);
+}
+
+function isPublisherFooterText(text) {
+    return publisherFooterKind(text) !== null;
+}
+
+function isUnambiguousPublisherFooterText(text) {
+    return UNAMBIGUOUS_PUBLISHER_FOOTER_KINDS.has(publisherFooterKind(text));
+}
+
+function publisherFooterKind(text) {
+    if (/(?:doi\.org\/10\.\d+)/iu.test(text)) return 'doi';
+    if (/\/journal\//iu.test(text)) return 'journal-url';
+    if (/^https?:\/\/\S+\/\d{4}\/\d+\/[a-z0-9-]+$/iu.test(text)) {
+        return 'article-url';
+    }
+    if (/\b(?:19|20)\d{2}\s*\|\s*vol\.\s*\d+\s*\|\s*[a-z0-9-]+\s*\|\s*p\.\s*\d+(?:https?:\/\/\S+)?$/iu.test(text)) {
+        return 'volume';
+    }
+    if (/^\(page number not for citation purposes\)$/iu.test(text)) {
+        return 'citation-note';
+    }
+    if (/^xsl[\s·•.-]*fo$/iu.test(text)) return 'xsl-fo';
+    if (/^renderx$/iu.test(text)) return 'renderx';
+    if (/\bet al(?:journal\b|[ \t]*[A-Z][A-Z .&'’-]{5,})/u.test(text)
+        && text.length <= 200) {
+        return 'publisher-masthead';
+    }
+    return null;
+}
+
+function isPublicationHeaderText(text) {
+    return /\b(?:19|20)\d{2}\b\s*,\s*\d+\s*,\s*\d+(?:\s|$)/u.test(text);
+}
+
+function pageChromeKeys(text) {
+    const keys = [text];
+    const publication = text.match(
+        /^.{1,80}?\b(?:19|20)\d{2}\b\s*,\s*\d+\s*,\s*\d+/u
+    )?.[0].replace(/[.\s]+$/u, '');
+    if (publication && publication !== text) keys.push(publication);
+    return keys;
+}
+
+function isLikelyPageChromeText(text) {
+    if (isPageNumberText(text)) return true;
+    if (/^!?\[|^#{1,6}(?:\s|$)|^\|/u.test(text)) return false;
+    return isPublicationHeaderText(text)
+        || /(?:doi\.org|\/journal\/|^https?:\/\/)/iu.test(text);
+}
+
+function findPublisherMastheadIndexes(lines) {
+    const titleIndex = lines.findIndex(line => (
+        /^ {0,3}#{1,6}[ \t]+\S/u.test(line)
+    ));
+    if (titleIndex <= 0) return [];
+    const prefix = lines.slice(0, titleIndex)
+        .map(line => comparableMarkdownText(line).toLowerCase())
+        .filter(Boolean);
+    const hasMDPI = prefix.includes('mdpi');
+    const hasArticle = prefix.includes('article');
+    const hasJournal = prefix.includes('sensors');
+    if (!hasMDPI || (!hasArticle && !hasJournal)) return [];
+    return Array.from({ length: titleIndex }, (_, index) => index);
+}
+
+function splitBlockTextLines(text) {
+    return String(text || '')
+        .split(/\r?\n/u)
+        .map(line => line.trim())
+        .filter(Boolean);
+}
+
+function comparableMarkdownText(value) {
+    let text = String(value || '').replace(/\r?\n$/, '').trim();
+    if (!text || /^!\[/u.test(text) || /^<!--/u.test(text)) return '';
+    text = text
+        .replace(/^ {0,3}#{1,6}[ \t]+/u, '')
+        .replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/u, '')
+        .replace(/^ {0,3}>[ \t]?/u, '')
+        .replace(/\[([^\]\r\n]+)\]\([^)]*\)/gu, '$1')
+        .replace(/[*_~`]/gu, '');
+    return normalizeComparableText(text);
+}
+
+function normalizeComparableText(value) {
+    return String(value || '').normalize('NFKC').replace(/\s+/gu, ' ').trim();
+}
+
+function normalizeBlock(block, page, dimensions, pageMap, tables, warnings) {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) {
+        warnings.push(`Mistral block on page ${page.index} was skipped.`);
+        return null;
+    }
+    const rawType = String(block.type || '').trim().toLowerCase();
+    const type = BLOCK_TYPES.get(rawType);
+    if (!type) {
+        warnings.push(`Mistral block on page ${page.index} was skipped.`);
+        return null;
+    }
+    if (!dimensions) {
+        warnings.push(`Mistral block on page ${page.index} has invalid dimensions.`);
+        return null;
+    }
+    const bbox = normalizeBBox(
+        block.bbox ?? block.bounding_box ?? block.boundingBox ?? block,
+        dimensions
+    );
+    if (!bbox) {
+        warnings.push(`Mistral block on page ${page.index} has an invalid bounding box.`);
+        return null;
+    }
+    const normalized = {
+        type,
+        pageIndex: page.index,
+        bbox,
+    };
+    if (type === 'image' || type === 'chart') {
+        const imageReference = firstString(
+            block.image_id,
+            block.imageId,
+            block.content,
+            block.assetPath,
+            block.text,
+            block.id
+        );
+        const assetPath = resolveAssetPath(imageReference, pageMap);
+        if (!assetPath) {
+            warnings.push(`Mistral image block on page ${page.index} was skipped.`);
+            return null;
+        }
+        normalized.assetPath = assetPath;
+        return normalized;
+    }
+    const text = normalizeMistralMarkdown(
+        blockText(block, type, tables),
+        { tables }
+    );
+    if (typeof text === 'string' && text) normalized.text = text;
+    const allowsEmptyText = ['header', 'footer'].includes(type)
+        || rawType === 'signature';
+    if (!normalized.text && !allowsEmptyText) {
+        warnings.push(`Mistral block on page ${page.index} has no text.`);
+        return null;
+    }
+    return normalized;
+}
+
+function blockText(block, type, tables) {
+    const candidates = [];
+    if (type === 'table') {
+        const tableID = firstString(block.table_id, block.tableId);
+        const tableContent = findTableContent(tables, tableID);
+        if (tableContent) candidates.push(tableContent);
+    }
+    candidates.push(block.content, block.text, block.latex);
+    if (type === 'list' && Array.isArray(block.list_items)) {
+        candidates.push(block.list_items
+            .filter(item => typeof item === 'string')
+            .join('\n'));
+    }
+    if (type === 'table') {
+        candidates.push(block.markdown, block.table_markdown, block.tableMarkdown);
+    }
+    return candidates.find(value => typeof value === 'string' && value.trim()) || null;
+}
+
+function findTableContent(tables, tableID) {
+    if (!(tables instanceof Map)) return null;
+    const normalizedID = normalizeTableID(tableID);
+    return normalizedID ? tables.get(normalizedID) || null : null;
+}
+
+function firstString(...values) {
+    return values.find(value => typeof value === 'string' && value) || null;
+}
+
+function normalizeBBox(value, dimensions) {
+    let x1;
+    let y1;
+    let x2;
+    let y2;
+    if (Array.isArray(value) && value.length === 4) {
+        [x1, y1, x2, y2] = value;
+    }
+    else if (value && typeof value === 'object') {
+        x1 = value.x1
+            ?? value.top_left_x
+            ?? value.topLeftX
+            ?? value.left
+            ?? value.x;
+        y1 = value.y1
+            ?? value.top_left_y
+            ?? value.topLeftY
+            ?? value.top
+            ?? value.y;
+        x2 = value.x2
+            ?? value.bottom_right_x
+            ?? value.bottomRightX
+            ?? value.right;
+        y2 = value.y2
+            ?? value.bottom_right_y
+            ?? value.bottomRightY
+            ?? value.bottom;
+        if (x2 === undefined && Number.isFinite(value.width)) {
+            x2 = Number(x1) + value.width;
+        }
+        if (y2 === undefined && Number.isFinite(value.height)) {
+            y2 = Number(y1) + value.height;
+        }
+    }
+    if (![x1, y1, x2, y2].every(Number.isFinite)
+        || x1 < 0
+        || y1 < 0
+        || x2 > dimensions.width
+        || y2 > dimensions.height
+        || x2 <= x1
+        || y2 <= y1) {
+        return null;
+    }
+    const normalized = [
+        x1 / dimensions.width * 1000,
+        y1 / dimensions.height * 1000,
+        x2 / dimensions.width * 1000,
+        y2 / dimensions.height * 1000,
+    ];
+    return normalized.every(Number.isFinite)
+        && normalized[0] < normalized[2]
+        && normalized[1] < normalized[3]
+        && normalized.every(value => value >= 0 && value <= 1000)
+        ? normalized
+        : null;
+}
+
+function resolveAssetPath(reference, pageMap) {
+    if (typeof reference !== 'string' || !reference) return null;
+    const source = reference.trim();
+    return pageMap.get(source)
+        || pageMap.get(decodeAssetReference(source));
+}
+
+function decodeAssetReference(value) {
+    try {
+        return decodeURIComponent(value);
+    }
+    catch {
+        return value;
+    }
+}
+
+function rewriteMarkdownImages(markdown, pageMap) {
+    if (!markdown) return markdown;
+    return markdown.replace(
+        /!\[([^\]\r\n]*)\]\(\s*(<[^>\r\n]+>|[^)\s]+)([^)]*)\)/g,
+        (match, alt, rawDestination, suffix) => {
+            const destination = rawDestination.startsWith('<')
+                ? rawDestination.slice(1, -1)
+                : rawDestination;
+            const path = resolveAssetPath(destination, pageMap);
+            if (!path) return `![${alt}]()`;
+            const title = suffix || '';
+            return `![${alt}](${path}${title})`;
+        }
+    );
+}
+
+function normalizeAssetPath(value) {
+    if (typeof value !== 'string') throw invalidResult('Mistral image ID is invalid');
+    const source = value.trim();
+    if (!source
+        || source.length > 1_024
+        || source.startsWith('/')
+        || source.includes('\\')
+        || /^[a-z][a-z0-9+.-]*:/i.test(source)
+        || /[\u0000-\u001f\u007f?#%]/u.test(source)) {
+        throw invalidResult('Mistral image ID is invalid');
+    }
+    const segments = source.split('/');
+    if (segments.some(segment => !segment || segment === '.' || segment === '..')) {
+        throw invalidResult('Mistral image ID is invalid');
+    }
+    return segments.join('/');
+}
+
+function decodeImage(value, mimeHint, path, maxBytes) {
+    if (typeof value !== 'string' || !value) {
+        throw invalidResult('Mistral image data is invalid');
+    }
+    let source = value;
+    let mimeType = normalizeMime(mimeHint) || mimeFromPath(path);
+    const dataURL = value.match(/^data:(image\/[a-z0-9.+-]+);base64,(.*)$/is);
+    if (dataURL) {
+        mimeType = normalizeMime(dataURL[1]);
+        source = dataURL[2];
+    }
+    if (!mimeType || !IMAGE_MIME_TYPES.has(mimeType.slice(6))) {
+        throw invalidResult('Mistral image MIME type is invalid');
+    }
+    if (!isBase64(source)) throw invalidResult('Mistral image data is invalid');
+    const paddedSource = source + '='.repeat((4 - source.length % 4) % 4);
+    const decodedLength = paddedSource.length / 4 * 3
+        - (paddedSource.endsWith('==') ? 2 : paddedSource.endsWith('=') ? 1 : 0);
+    if (!decodedLength || decodedLength > maxBytes) {
+        throw invalidResult('Mistral image exceeds the configured resource limit');
+    }
+    let binary;
+    try {
+        binary = (globalThis.atob || atob)(paddedSource);
+    }
+    catch {
+        throw invalidResult('Mistral image data is invalid');
+    }
+    if (binary.length !== decodedLength) {
+        throw invalidResult('Mistral image data is invalid');
+    }
+    const data = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) data[index] = binary.charCodeAt(index);
+    return { source: value, mimeType, data };
+}
+
+function isBase64(value) {
+    return value.length > 0
+        && value.length % 4 !== 1
+        && /^[A-Za-z0-9+/]*={0,2}$/u.test(value)
+        && !/=/.test(value.slice(0, -2));
+}
+
+function normalizeMime(value) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'image/jpg') return 'image/jpeg';
+    return /^image\/(?:png|jpeg|gif|webp)$/u.test(normalized)
+        ? normalized
+        : null;
+}
+
+function mimeFromPath(path) {
+    const extension = path.toLowerCase().match(/\.([a-z0-9]+)$/u)?.[1];
+    return extension ? IMAGE_MIME_TYPES.get(extension) || null : null;
+}
+
+function limitSourceMap(sourceMap, maxLocations) {
+    if (!Number.isSafeInteger(maxLocations) || maxLocations < 1) return [];
+    const result = [];
+    let remaining = maxLocations;
+    for (const entry of sourceMap) {
+        if (remaining <= 0) break;
+        const locations = entry.locations.slice(0, remaining);
+        if (!locations.length) continue;
+        const locationSet = new Set(locations.map(location => (
+            `${location.pageIndex}:${location.bbox.join(',')}`
+        )));
+        const locationRanges = (entry.locationRanges || []).filter(range => (
+            locationSet.has(`${range.location.pageIndex}:${range.location.bbox.join(',')}`)
+        ));
+        result.push({
+            ...entry,
+            locations,
+            ...(locationRanges.length ? { locationRanges } : {}),
+        });
+        remaining -= locations.length;
+    }
+    return result;
+}
+
+function invalidResult(message) {
+    const error = new Error(message);
+    error.code = 'MISTRAL_INVALID_RESULT';
+    return error;
+}
