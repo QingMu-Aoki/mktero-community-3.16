@@ -22,7 +22,7 @@ Inherited from Mktero: Markdown reading with formulas and tables, headings and f
 
 Declared compatibility: Zotero **7.0–10.0.***. Development checks and packaging were performed on Windows; the community release has not yet been verified across all these Zotero versions. PDFs must be downloaded locally.
 
-1. Download `mktero-community-<version>.xpi` from the Assets section of [this repository’s Releases](https://github.com/QingMu-Aoki/mktero-community/releases/latest).
+1. Download `mktero-community-<version>.xpi` from the Assets section of [this repository’s Releases](https://github.com/QingMu-Aoki/mktero-community-3.16/releases/latest).
 2. **Disable the original Mktero or the earlier Local Import Preview before enabling this fork.** It has its own plugin ID but shares existing settings and data formats; running both is unsupported.
 3. In Zotero, choose **Tools → Plugins → gear menu → Install Add-on From File** and select the XPI.
 4. Open **Settings → Mktero Community**, choose MinerU, enter your API Token, and click **Save accounts**. Existing Token settings remain available.
