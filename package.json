@@ -16,7 +16,7 @@
   "devDependencies": {
     "esbuild": "^0.28.2",
     "jsdom": "30.0.1",
-    "linkedom": "0.18.13"
+    "linkedom": "0.18.15"
   },
   "dependencies": {
     "@ai-sdk/alibaba": "^2.0.41",
